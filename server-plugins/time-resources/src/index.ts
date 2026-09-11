@@ -58,6 +58,12 @@ import tracker, { Issue, IssueStatus, Project, TimeSpendReport } from '@hcengine
 export async function OnTask (txes: TxCUD<Doc>[], control: TriggerControl): Promise<Tx[]> {
   const result: Tx[] = []
   for (const tx of txes) {
+    // Projeto saindo de um tipo classic: fecha o que o Planner deixaria pendurado.
+    // Mora aqui, e não num trigger próprio, porque OnTask é o único registrado sem `txMatch`
+    // (recebe todo TxCUD) — um trigger novo exigiria mexer no modelo e, com ele, um upgrade
+    // de workspace só para isso.
+    result.push(...(await closeToDosOnLeavingClassic(tx, control)))
+
     const mixin = control.hierarchy.classHierarchyMixin<Class<Doc>, ToDoFactory>(
       tx.objectClass,
       serverTime.mixin.ToDoFactory
@@ -74,6 +80,53 @@ export async function OnTask (txes: TxCUD<Doc>[], control: TriggerControl): Prom
   }
 
   return result
+}
+
+/** Quantas issues por lote ao procurar ToDos por `attachedTo`. Evita um `$in` gigante. */
+const TODO_LOOKUP_BATCH = 200
+
+/**
+ * Todo handler de ToDo deste plugin começa com `if (!type?.classic) return []`: o Planner só
+ * existe para projeto de tipo classic. Quando um projeto passa a um tipo NÃO-classic, os ToDos
+ * já criados não somem sozinhos — ficariam abertos e congelados no Planner das pessoas,
+ * inclusive os de tarefas que a própria troca de tipo acabou de concluir. Fechamos os que estão
+ * em aberto, que é exatamente o que o Planner faz quando uma tarefa vai para Won/Lost.
+ */
+async function closeToDosOnLeavingClassic (tx: TxCUD<Doc>, control: TriggerControl): Promise<Tx[]> {
+  if (tx._class !== core.class.TxUpdateDoc) return []
+  if (!control.hierarchy.isDerived(tx.objectClass, tracker.class.Project)) return []
+
+  const updateTx = tx as TxUpdateDoc<Project>
+  const newTypeId = updateTx.operations.type
+  if (newTypeId === undefined) return []
+
+  const newType = (await control.modelDb.findAll(task.class.ProjectType, { _id: newTypeId }))[0]
+  if (newType === undefined || newType.classic) return []
+
+  const project = updateTx.objectId
+  const open = new Map<Ref<ToDo>, ToDo>()
+
+  // Caminho normal: o ToDo de uma issue guarda o projeto dela em `attachedSpace`.
+  for (const todo of await control.findAll(control.ctx, time.class.ToDo, { attachedSpace: project, doneOn: null })) {
+    open.set(todo._id, todo)
+  }
+
+  // `attachedSpace` é opcional e pode faltar em ToDos antigos, então varremos também por issue.
+  const issues = await control.findAll(control.ctx, tracker.class.Issue, { space: project }, { projection: { _id: 1 } })
+  for (let i = 0; i < issues.length; i += TODO_LOOKUP_BATCH) {
+    const ids = issues.slice(i, i + TODO_LOOKUP_BATCH).map((it) => it._id)
+    for (const todo of await control.findAll(control.ctx, time.class.ToDo, {
+      attachedTo: { $in: ids },
+      doneOn: null
+    })) {
+      open.set(todo._id, todo)
+    }
+  }
+
+  const now = Date.now()
+  return Array.from(open.values()).map((todo) =>
+    control.txFactory.createTxUpdateDoc(todo._class, todo.space, todo._id, { doneOn: now })
+  )
 }
 
 export async function OnWorkSlotUpdate (txes: Tx[], control: TriggerControl): Promise<Tx[]> {

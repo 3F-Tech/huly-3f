@@ -16,7 +16,9 @@
     "fix-issues": "tsx fix-issues.ts",
     "delete-test-issues": "tsx delete-test-issues.ts",
     "debug-task": "tsx debug-task.ts",
-    "debug-template": "tsx debug-template.ts"
+    "debug-template": "tsx debug-template.ts",
+    "list-project-types": "tsx list-project-types.ts",
+    "project-type-preview": "tsx project-type-preview.ts"
   },
   "dependencies": {
     "@hcengineering/account-client": "file:../foundations/core/packages/account-client",

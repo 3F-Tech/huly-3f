@@ -526,6 +526,11 @@ async function handleAutomaticDates (updateTx: TxUpdateDoc<Issue>, control: Trig
   if (!Object.prototype.hasOwnProperty.call(updateTx.operations, 'status')) {
     return []
   }
+  // Troca de tipo de projeto (status + kind no mesmo update): a tarefa já estava concluída,
+  // só mudou de workflow. Carimbar completedDate aqui marcaria a data da MIGRAÇÃO.
+  if (updateTx.operations.kind !== undefined) {
+    return []
+  }
 
   const newStatusId = updateTx.operations.status as Ref<IssueStatus>
   const [newStatus] = await control.findAll(control.ctx, tracker.class.IssueStatus, { _id: newStatusId }, { limit: 1 })
@@ -595,6 +600,11 @@ export async function OnIssueCompletionCheck (txes: Tx[], control: TriggerContro
     const updateTx = tx as TxUpdateDoc<Issue>
     if (!control.hierarchy.isDerived(updateTx.objectClass, tracker.class.Issue)) continue
     if (updateTx.operations.status === undefined) continue
+    // Troca de tipo de projeto: o remapeamento grava `status` e `kind` no mesmo update.
+    // Não é o usuário concluindo a tarefa — é o workflow inteiro sendo trocado —, então as
+    // regras de conclusão não se aplicam. Revertê-las aqui devolveria a tarefa a um status
+    // do tipo ANTIGO, que não existe mais no projeto, e ela sumiria das visões.
+    if (updateTx.operations.kind !== undefined) continue
 
     const newStatusId = updateTx.operations.status as Ref<IssueStatus>
 

@@ -36,7 +36,6 @@
   import presentation, {
     IconWithEmoji,
     Card,
-    MessageBox,
     createQuery,
     getClient,
     hasResource
@@ -63,7 +62,7 @@
   import { createEventDispatcher } from 'svelte'
 
   import tracker from '../../plugin'
-  import { changeProjectType } from '../../utils'
+  import ChangeProjectTypePopup from './ChangeProjectTypePopup.svelte'
   import StatusSelector from '../issues/StatusSelector.svelte'
 
   export let project: Project | undefined = undefined
@@ -171,22 +170,20 @@
       return
     }
 
-    // Troca de tipo: operação pesada (remapeia status/kind de todas as tarefas). Confirma antes.
+    // Troca de tipo: remapeia status/kind de todas as tarefas do projeto (subtarefas de
+    // qualquer profundidade incluídas). O popup mostra o de-para status a status, já
+    // sugerido, para o usuário revisar uma vez em vez de corrigir tarefa por tarefa depois.
     if (typeChanged && typeId !== undefined) {
       const targetProject = project
       const newTypeId = typeId
-      const initial = defaultStatus
-      const res = await client.findAll(tracker.class.Issue, { space: targetProject._id }, { limit: 1, total: true })
-      showPopup(MessageBox, {
-        label: tracker.string.ChangeProjectType,
-        message: tracker.string.ChangeProjectTypeConfirm,
-        params: { count: res.total },
-        dangerous: true,
-        action: async () => {
+      showPopup(ChangeProjectTypePopup, {
+        project: targetProject,
+        newTypeId,
+        preferredInitial: defaultStatus,
+        // demais campos do formulário; roles e default status são tratados pela migração
+        afterMigrate: async () => {
           isSaving = true
           try {
-            await changeProjectType(client, targetProject, newTypeId, initial)
-            // demais campos do formulário; roles e default status são tratados pela migração
             await applyFieldUpdates(false)
           } finally {
             isSaving = false

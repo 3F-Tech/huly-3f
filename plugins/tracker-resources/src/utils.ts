@@ -27,6 +27,7 @@ import core, {
   type Doc,
   type DocumentQuery,
   type DocumentUpdate,
+  type IdMap,
   type Ref,
   type Space,
   type Status,
@@ -40,7 +41,13 @@ import core, {
 } from '@hcengineering/core'
 import { type IntlString } from '@hcengineering/platform'
 import { createQuery, getClient, onClient } from '@hcengineering/presentation'
-import task, { getStatusIndex, makeRank, type TaskType, type ProjectType } from '@hcengineering/task'
+import task, {
+  getStatusIndex,
+  makeRank,
+  type TaskType,
+  type TaskTypeKind,
+  type ProjectType
+} from '@hcengineering/task'
 import {
   selectedTaskTypeStore,
   activeProjects as taskActiveProjects,
@@ -565,81 +572,478 @@ export async function collectIssues (client: TxOperations, docs: Doc[]): Promise
 /**
  * @public
  *
+ * Uma linha do plano de troca de tipo: um par (tipo de tarefa, status) hoje em uso no projeto
+ * e para onde ele vai no novo tipo. A chave é o PAR, não só o status: o Huly reaproveita o
+ * mesmo documento de Status entre tipos de tarefa quando nome e categoria coincidem
+ * (`createState`), então um projeto com mais de um tipo de tarefa costuma ter o mesmo
+ * `Ref<IssueStatus>` em vários deles. Chavear só pelo status fundiria os tipos de tarefa.
+ *
+ * `count` inclui subtarefas de qualquer profundidade — todas compartilham o `space` do projeto.
+ */
+export interface StatusMigrationRow {
+  fromKind: Ref<TaskType>
+  from: Ref<IssueStatus>
+  toKind: Ref<TaskType>
+  to: Ref<IssueStatus>
+  count: number
+  /** Como o destino foi sugerido: nome idêntico, mesma posição dentro da categoria, ou fallback. */
+  suggestedBy: 'name' | 'category' | 'fallback'
+}
+
+/**
+ * @public
+ *
+ * As linhas de um mesmo tipo de tarefa de origem. O tipo de tarefa destino é escolhido uma vez
+ * por grupo e vale para todas as linhas dele.
+ */
+export interface StatusMigrationGroup {
+  fromKind: Ref<TaskType>
+  fromKindName: string
+  toKind: Ref<TaskType>
+  count: number
+  rows: StatusMigrationRow[]
+}
+
+/**
+ * @public
+ */
+export interface StatusMigrationPlan {
+  /** De-para sugerido, agrupado por tipo de tarefa de origem. */
+  groups: StatusMigrationGroup[]
+  /** Tipos de tarefa de Issue do novo tipo, na ordem do tipo. */
+  targetTaskTypes: TaskType[]
+  /** Status de cada tipo de tarefa do novo tipo, na ordem declarada. */
+  statusesByTaskType: Map<Ref<TaskType>, Array<Ref<IssueStatus>>>
+  /** Status inicial do novo tipo (vira o `defaultIssueStatus` do projeto). */
+  initial: Ref<IssueStatus>
+  /** Total de tarefas do projeto. */
+  total: number
+}
+
+/**
+ * @public
+ */
+export interface StatusMigrationTarget {
+  kind: Ref<TaskType>
+  status: Ref<IssueStatus>
+}
+
+/**
+ * @public
+ *
+ * De-para da migração, indexado por `statusMigrationKey(kind, status)` de origem.
+ */
+export type StatusMigrationMapping = Map<string, StatusMigrationTarget>
+
+/**
+ * @public
+ *
+ * Chave de uma tarefa no de-para: o par (tipo de tarefa, status).
+ */
+export function statusMigrationKey (kind: Ref<TaskType> | undefined, status: Ref<IssueStatus>): string {
+  return `${kind ?? ''}|${status}`
+}
+
+/**
+ * @public
+ */
+export interface ChangeProjectTypeOptions {
+  /** De-para explícito (ver `buildStatusMigrationPlan`). Pares ausentes usam o fallback por categoria. */
+  mapping?: StatusMigrationMapping
+  /** Status inicial do novo tipo; usado como fallback e como `defaultIssueStatus` do projeto. */
+  preferredInitial?: Ref<IssueStatus>
+  /** Chamado a cada lote gravado, para a UI mostrar progresso. */
+  onProgress?: (done: number, total: number) => void
+  /** Tamanho do lote e pausa entre lotes. Os defaults são calibrados para não saturar o transactor. */
+  batchSize?: number
+  pauseMs?: number
+}
+
+/**
+ * Quantas issues por `apply`, e quanto esperar entre um lote e o outro.
+ *
+ * Cada update de issue acorda uma cadeia de triggers no transactor — `isDone` (task), ToDo do
+ * Planner (time, em projeto classic), datas automáticas —, e vários deles fazem consultas
+ * próprias. Um lote grande vira um único tx que ocupa o transactor por muito tempo, que é
+ * justamente como o workspace já congelou antes (fila de requisições entupida). Lote curto com
+ * pausa deixa o transactor atender os outros usuários entre um lote e outro: a migração demora
+ * alguns minutos, mas ninguém fica travado enquanto ela roda.
+ */
+const CHANGE_TYPE_BATCH = 25
+const CHANGE_TYPE_PAUSE_MS = 5000
+
+async function pause (ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * @public
+ *
+ * Estimativa grosseira, em minutos, de quanto a migração vai levar: as pausas entre lotes mais
+ * uma folga por lote para o processamento. Serve para avisar o usuário que ele precisa deixar a
+ * janela aberta — não é promessa de prazo.
+ */
+export function estimateMigrationMinutes (
+  total: number,
+  batchSize: number = CHANGE_TYPE_BATCH,
+  pauseMs: number = CHANGE_TYPE_PAUSE_MS
+): number {
+  const batches = Math.ceil(total / Math.max(1, batchSize))
+  return Math.max(1, Math.ceil((batches * (pauseMs + 1000)) / 60000))
+}
+
+/** Nome comparável: sem acento, sem caixa, sem espaço nas pontas. */
+function normalizeTypeName (name: string | undefined): string {
+  return (name ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+}
+
+function notEmptyValue<T> (value: T | undefined): value is T {
+  return value !== undefined
+}
+
+/** TaskTypes de Issue de um ProjectType, na ordem declarada pelo tipo. */
+function getIssueTaskTypes (type: ProjectType): TaskType[] {
+  const all = get(taskTypeStore)
+  const ordered = type.tasks.map((it) => all.get(it)).filter(notEmptyValue)
+  for (const tt of all.values()) {
+    if (tt.parent === type._id && !ordered.some((it) => it._id === tt._id)) {
+      ordered.push(tt)
+    }
+  }
+  return ordered.filter((tt) => tt.ofClass === tracker.class.Issue)
+}
+
+interface ResolvedTargetType {
+  type: ProjectType
+  taskTypes: TaskType[]
+  statusesByTaskType: Map<Ref<TaskType>, Array<Ref<IssueStatus>>>
+  initial: Ref<IssueStatus>
+}
+
+/** Resolve tudo que depende do novo tipo: tipos de tarefa, seus status e o status inicial. */
+function resolveTargetType (newTypeId: Ref<ProjectType>, preferredInitial?: Ref<IssueStatus>): ResolvedTargetType {
+  const type = get(typeStore).get(newTypeId)
+  if (type === undefined) {
+    throw new Error(`Project type ${newTypeId} not found`)
+  }
+  const taskTypes = getIssueTaskTypes(type)
+  if (taskTypes.length === 0) {
+    throw new Error(`No issue task type found for project type ${newTypeId}`)
+  }
+
+  const statusesByTaskType = new Map<Ref<TaskType>, Array<Ref<IssueStatus>>>()
+  for (const tt of taskTypes) {
+    statusesByTaskType.set(tt._id, tt.statuses as Array<Ref<IssueStatus>>)
+  }
+  const first = statusesByTaskType.get(taskTypes[0]._id) ?? []
+  if (first.length === 0) {
+    throw new Error(`Task type ${taskTypes[0]._id} has no statuses`)
+  }
+
+  const allStatuses = taskTypes.flatMap((tt) => tt.statuses as Array<Ref<IssueStatus>>)
+  const initial =
+    preferredInitial !== undefined && allStatuses.includes(preferredInitial) ? preferredInitial : first[0]
+
+  return { type, taskTypes, statusesByTaskType, initial }
+}
+
+/**
+ * Todo tipo de tarefa tem um papel (`TaskType.kind`): serve como tarefa, como subtarefa, ou como
+ * ambos — é o "Tarefa / Sub-Tarefa / Tarefa e Sub-Tarefa" da tela de configuração do tipo de
+ * projeto. Mandar tarefas de um papel para um tipo do papel oposto deixaria o projeto
+ * inconsistente, então só tratamos como candidatos os papéis compatíveis.
+ */
+function taskKindsCompatible (from: TaskTypeKind, to: TaskTypeKind): boolean {
+  return from === to || from === 'both' || to === 'both'
+}
+
+/**
+ * Casa um tipo de tarefa de origem com um do destino:
+ *  1. mesmo nome (sem acento, sem caixa) — é o mesmo tipo, independente do papel;
+ *  2. entre os de papel compatível, preferindo papel idêntico, o de mesma posição relativa;
+ *  3. o primeiro candidato compatível.
+ */
+function suggestTaskType (from: TaskType | undefined, sources: TaskType[], targets: TaskType[]): Ref<TaskType> {
+  if (from === undefined) {
+    return targets[0]._id
+  }
+
+  const name = normalizeTypeName(from.name)
+  const byName = targets.find((it) => normalizeTypeName(it.name) === name)
+  if (byName !== undefined) {
+    return byName._id
+  }
+
+  const compatible = targets.filter((it) => taskKindsCompatible(from.kind, it.kind))
+  const pool = compatible.length > 0 ? compatible : targets
+  const sameRole = pool.filter((it) => it.kind === from.kind)
+  const preferred = sameRole.length > 0 ? sameRole : pool
+
+  // Posição relativa entre os tipos de MESMO papel, para não comparar tarefa com subtarefa.
+  const peers = sources.filter((it) => it.kind === from.kind)
+  const idx = peers.findIndex((it) => it._id === from._id)
+  if (idx >= 0 && idx < preferred.length) {
+    return preferred[idx]._id
+  }
+
+  return preferred[0]._id
+}
+
+/**
+ * Sugere o status destino DENTRO de um tipo de tarefa já escolhido:
+ *  1. mesmo nome (sem acento, sem caixa);
+ *  2. mesma categoria e mesma posição relativa dentro dela;
+ *  3. primeiro status do tipo de tarefa destino.
+ */
+function suggestTargetStatus (
+  from: Status | undefined,
+  sourceDocs: Status[],
+  targetDocs: Status[],
+  fallback: Ref<IssueStatus>
+): { to: Ref<IssueStatus>, suggestedBy: StatusMigrationRow['suggestedBy'] } {
+  if (from === undefined || targetDocs.length === 0) {
+    return { to: fallback, suggestedBy: 'fallback' }
+  }
+
+  const name = normalizeTypeName(from.name)
+  const byName = targetDocs.find((it) => normalizeTypeName(it.name) === name)
+  if (byName !== undefined) {
+    return { to: byName._id as Ref<IssueStatus>, suggestedBy: 'name' }
+  }
+
+  const category = from.category
+  if (category !== undefined) {
+    const targetSiblings = targetDocs.filter((it) => it.category === category)
+    if (targetSiblings.length > 0) {
+      const sourceSiblings = sourceDocs.filter((it) => it.category === category)
+      const idx = Math.max(
+        0,
+        sourceSiblings.findIndex((it) => it._id === from._id)
+      )
+      const picked = targetSiblings[Math.min(idx, targetSiblings.length - 1)]
+      return { to: picked._id as Ref<IssueStatus>, suggestedBy: 'category' }
+    }
+  }
+
+  return { to: fallback, suggestedBy: 'fallback' }
+}
+
+/**
+ * @public
+ *
+ * Monta o de-para sugerido para trocar `project` para `newTypeId`, contando quantas tarefas
+ * existem em cada par (tipo de tarefa, status) — subtarefas de qualquer profundidade incluídas,
+ * já que todas compartilham o `space` do projeto.
+ *
+ * O plano vem agrupado por tipo de tarefa de origem: cada grupo aponta para um tipo de tarefa do
+ * novo tipo (casado por nome, senão por posição), e dentro dele cada status ganha um destino
+ * sugerido. O usuário revisa isso uma vez e vale para todas as tarefas.
+ */
+export async function buildStatusMigrationPlan (
+  client: TxOperations,
+  project: Project,
+  newTypeId: Ref<ProjectType>,
+  preferredInitial?: Ref<IssueStatus>
+): Promise<StatusMigrationPlan> {
+  const { taskTypes: targetTaskTypes, statusesByTaskType, initial } = resolveTargetType(newTypeId, preferredInitial)
+  const byId = get(statusStore).byId
+  const allTaskTypes = get(taskTypeStore)
+
+  // Contagem por par (kind, status). Projeção mínima: só o que decide a migração.
+  const issues = await client.findAll(
+    tracker.class.Issue,
+    { space: project._id },
+    { projection: { _id: 1, status: 1, kind: 1 } }
+  )
+  const counts = new Map<string, { kind: Ref<TaskType>, status: Ref<IssueStatus>, count: number }>()
+  for (const issue of issues) {
+    const key = statusMigrationKey(issue.kind, issue.status)
+    const entry = counts.get(key)
+    if (entry !== undefined) {
+      entry.count++
+    } else {
+      counts.set(key, { kind: issue.kind, status: issue.status, count: 1 })
+    }
+  }
+
+  // Ordem de exibição dos tipos de tarefa: a do tipo atual; tipos legados entram no fim.
+  const currentType = get(typeStore).get(project.type)
+  const sourceTaskTypes = currentType !== undefined ? getIssueTaskTypes(currentType) : []
+  const orderedKinds: Array<Ref<TaskType>> = sourceTaskTypes.map((it) => it._id)
+  for (const { kind } of counts.values()) {
+    if (!orderedKinds.includes(kind)) {
+      orderedKinds.push(kind)
+    }
+  }
+
+  const groups: StatusMigrationGroup[] = []
+  for (const kind of orderedKinds) {
+    const entries = Array.from(counts.values()).filter((it) => it.kind === kind)
+    // Tipo de tarefa do tipo atual sem nenhuma tarefa não exige decisão do usuário.
+    if (entries.length === 0) continue
+
+    const sourceTaskType = allTaskTypes.get(kind)
+    const toKind = suggestTaskType(sourceTaskType, sourceTaskTypes, targetTaskTypes)
+
+    // Ordem dos status dentro do grupo: a do tipo de tarefa de origem; legados no fim.
+    const orderedStatuses = (sourceTaskType?.statuses ?? []) as Array<Ref<IssueStatus>>
+    const sorted = [...entries].sort((a, b) => {
+      const ia = orderedStatuses.indexOf(a.status)
+      const ib = orderedStatuses.indexOf(b.status)
+      return (ia === -1 ? Number.MAX_SAFE_INTEGER : ia) - (ib === -1 ? Number.MAX_SAFE_INTEGER : ib)
+    })
+
+    const rows = sorted.map((entry) => ({
+      fromKind: kind,
+      from: entry.status,
+      toKind,
+      count: entry.count,
+      ...suggestRowTarget(entry.status, sourceTaskType, toKind, statusesByTaskType, byId, initial)
+    }))
+
+    groups.push({
+      fromKind: kind,
+      fromKindName: sourceTaskType?.name ?? '',
+      toKind,
+      count: entries.reduce((sum, it) => sum + it.count, 0),
+      rows
+    })
+  }
+
+  return { groups, targetTaskTypes, statusesByTaskType, initial, total: issues.length }
+}
+
+/**
+ * @public
+ *
+ * Destino sugerido de um status, dado o tipo de tarefa destino já escolhido. Exposto para a UI
+ * poder re-sugerir as linhas de um grupo quando o usuário troca o tipo de tarefa destino dele.
+ */
+export function suggestRowTarget (
+  from: Ref<IssueStatus>,
+  sourceTaskType: TaskType | undefined,
+  toKind: Ref<TaskType>,
+  statusesByTaskType: Map<Ref<TaskType>, Array<Ref<IssueStatus>>>,
+  byId: IdMap<Status>,
+  initial: Ref<IssueStatus>
+): { to: Ref<IssueStatus>, suggestedBy: StatusMigrationRow['suggestedBy'] } {
+  const targetIds = statusesByTaskType.get(toKind) ?? []
+  const targetDocs = targetIds.map((id) => byId.get(id)).filter(notEmptyValue)
+  const sourceDocs = ((sourceTaskType?.statuses ?? []) as Array<Ref<IssueStatus>>)
+    .map((id) => byId.get(id))
+    .filter(notEmptyValue)
+  const fallback = targetIds[0] ?? initial
+  return suggestTargetStatus(byId.get(from), sourceDocs, targetDocs, fallback)
+}
+
+/**
+ * @public
+ *
  * Troca o ProjectType de um projeto existente, remapeando todas as issues (e templates) do
- * projeto para o `kind`/`status` válidos do novo tipo. O mapeamento é por categoria de status:
- *  - categoria "Won"  → primeiro status "Won" do novo tipo (finalizado é preservado);
- *  - categoria "Lost" → primeiro status "Lost" do novo tipo (cancelado é preservado);
- *  - qualquer outra (em aberto) → status inicial do novo tipo.
+ * projeto para o `kind`/`status` válidos do novo tipo. O destino de cada tarefa vem do `mapping`
+ * pelo par (tipo de tarefa, status) — montado por `buildStatusMigrationPlan` e revisado pelo
+ * usuário na UI. Pares ausentes caem no fallback por categoria dentro do tipo de tarefa casado
+ * por nome: "Won" → primeiro "Won", "Lost" → primeiro "Lost", qualquer outro → primeiro status.
+ *
+ * Tarefas que já estão num par (tipo de tarefa, status) válido do novo tipo são deixadas como
+ * estão, o que torna a operação repetível: se ela falhar no meio, rodar de novo termina o
+ * serviço sem estragar o que já migrou.
+ *
+ * O update de cada tarefa grava `status` e `kind` juntos — é essa assinatura que faz os triggers
+ * de conclusão (F01) e de datas automáticas pularem a tarefa, já que não se trata de alguém
+ * concluindo nada, e sim do workflow inteiro sendo trocado.
  *
  * As roles do tipo anterior NÃO são migradas (papéis pertencem ao ProjectType); apenas garantimos
- * o mixin do novo `targetClass` para o projeto continuar consistente. Toda a migração roda num
- * único `apply` (atômica): ou tudo é aplicado, ou nada.
+ * o mixin do novo `targetClass` para o projeto continuar consistente. As tarefas são gravadas em
+ * lotes de `CHANGE_TYPE_BATCH` (cada lote é um `apply` atômico) para não montar um tx gigante.
  */
 export async function changeProjectType (
   client: TxOperations,
   project: Project,
   newTypeId: Ref<ProjectType>,
-  preferredInitial?: Ref<IssueStatus>
+  options: ChangeProjectTypeOptions = {}
 ): Promise<void> {
+  const {
+    mapping,
+    preferredInitial,
+    onProgress,
+    batchSize = CHANGE_TYPE_BATCH,
+    pauseMs = CHANGE_TYPE_PAUSE_MS
+  } = options
   const hierarchy = client.getHierarchy()
-  const newType = get(typeStore).get(newTypeId)
-  if (newType === undefined) {
-    throw new Error(`Project type ${newTypeId} not found`)
+  const {
+    type: newType,
+    taskTypes,
+    statusesByTaskType,
+    initial
+  } = resolveTargetType(newTypeId, preferredInitial)
+
+  const byId = get(statusStore).byId
+  const allTaskTypes = get(taskTypeStore)
+  const currentType = get(typeStore).get(project.type)
+  const sourceTaskTypes = currentType !== undefined ? getIssueTaskTypes(currentType) : []
+  const defaultTaskType = taskTypes[0]
+
+  const isValidTarget = (kind: Ref<TaskType>, status: Ref<IssueStatus>): boolean =>
+    statusesByTaskType.get(kind)?.includes(status) ?? false
+
+  /** Fallback: casa o tipo de tarefa por nome e, dentro dele, o status pela categoria. */
+  const fallbackFor = (issue: Issue): StatusMigrationTarget => {
+    const kind = suggestTaskType(allTaskTypes.get(issue.kind), sourceTaskTypes, taskTypes)
+    const targetIds = statusesByTaskType.get(kind) ?? []
+    const category = byId.get(issue.status)?.category
+    const byCategory =
+      category !== undefined ? targetIds.find((s) => byId.get(s)?.category === category) : undefined
+    return { kind, status: byCategory ?? targetIds[0] ?? initial }
   }
 
-  // TaskType de Issue dentro do novo tipo (assume o primeiro, como no resto do tracker)
-  const targetTaskType = Array.from(get(taskTypeStore).values()).find(
-    (tt) => tt.parent === newTypeId && tt.ofClass === tracker.class.Issue
-  )
-  if (targetTaskType === undefined) {
-    throw new Error(`No issue task type found for project type ${newTypeId}`)
-  }
-  if (targetTaskType.statuses.length === 0) {
-    throw new Error(`Task type ${targetTaskType._id} has no statuses`)
-  }
-
-  const statuses = get(statusStore).byId
-
-  // Status-alvo por categoria, a partir da lista ordenada de status do novo TaskType
-  const initial: Ref<IssueStatus> = (
-    preferredInitial !== undefined && targetTaskType.statuses.includes(preferredInitial)
-      ? preferredInitial
-      : targetTaskType.statuses[0]
-  ) as Ref<IssueStatus>
-  const findByCategory = (category: Ref<StatusCategory>): Ref<IssueStatus> | undefined =>
-    targetTaskType.statuses.find((s) => statuses.get(s)?.category === category) as Ref<IssueStatus> | undefined
-  const wonStatus = findByCategory(task.statusCategory.Won) ?? initial
-  const lostStatus = findByCategory(task.statusCategory.Lost) ?? initial
-
-  const applyOps = client.apply('change-project-type')
-
-  // Todas as issues do projeto (sub-issues compartilham o mesmo space)
+  // Todas as issues do projeto — subtarefas de qualquer profundidade compartilham o mesmo space.
   const issues = await client.findAll(tracker.class.Issue, { space: project._id })
-  for (const issue of issues) {
-    const category = statuses.get(issue.status)?.category
-    const newStatus =
-      category === task.statusCategory.Won
-        ? wonStatus
-        : category === task.statusCategory.Lost
-          ? lostStatus
-          : initial
-    if (issue.status !== newStatus || issue.kind !== targetTaskType._id) {
-      await applyOps.update(issue, { status: newStatus, kind: targetTaskType._id })
+  const pending = issues.filter((issue) => !isValidTarget(issue.kind, issue.status))
+
+  let done = 0
+  for (let i = 0; i < pending.length; i += batchSize) {
+    const batch = pending.slice(i, i + batchSize)
+    const applyOps = client.apply('change-project-type')
+    for (const issue of batch) {
+      const mapped = mapping?.get(statusMigrationKey(issue.kind, issue.status))
+      const target = mapped !== undefined && isValidTarget(mapped.kind, mapped.status) ? mapped : fallbackFor(issue)
+      if (issue.status !== target.status || issue.kind !== target.kind) {
+        // status e kind juntos: ver nota sobre os triggers no doc desta função.
+        await applyOps.update(issue, { status: target.status, kind: target.kind })
+      }
+    }
+    await applyOps.commit()
+    done += batch.length
+    onProgress?.(done, pending.length)
+
+    // Respira entre lotes para o transactor atender os outros usuários.
+    if (done < pending.length && pauseMs > 0) {
+      await pause(pauseMs)
     }
   }
 
-  // Templates do projeto: só o kind (templates não guardam status de execução)
+  // Templates: só o kind (templates não guardam status de execução). Casa por nome do tipo de tarefa.
   const templates = await client.findAll(tracker.class.IssueTemplate, { space: project._id })
-  for (const template of templates) {
-    if (template.kind !== targetTaskType._id) {
-      await applyOps.update(template, { kind: targetTaskType._id })
+  if (templates.length > 0) {
+    const applyOps = client.apply('change-project-type-templates')
+    for (const template of templates) {
+      const newKind =
+        template.kind !== undefined
+          ? suggestTaskType(allTaskTypes.get(template.kind), sourceTaskTypes, taskTypes)
+          : defaultTaskType._id
+      if (template.kind !== newKind) {
+        await applyOps.update(template, { kind: newKind })
+      }
     }
+    await applyOps.commit()
   }
 
-  // O próprio projeto por último, dentro do mesmo apply
-  await applyOps.update(project, { type: newTypeId, defaultIssueStatus: initial })
-
-  await applyOps.commit()
+  await client.update(project, { type: newTypeId, defaultIssueStatus: initial })
 
   // Garante o mixin do targetClass do novo tipo (guarda roles/atributos por tipo)
   if (!hierarchy.hasMixin(project, newType.targetClass)) {
